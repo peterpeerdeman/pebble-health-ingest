@@ -34,7 +34,7 @@ services:
       - influxdb
 
   pebble-ingest:
-    image: peterpeerdeman/pebble-ingest:1.0.0
+    image: ghcr.io/peterpeerdeman/pebble-ingest:1.0.0
     build: .
     container_name: pebble-ingest
     restart: always

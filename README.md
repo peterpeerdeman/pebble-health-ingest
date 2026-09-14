@@ -101,7 +101,7 @@ to that compose file; it reaches Influx by container name on the same network:
 
 ```yaml
   pebble-ingest:
-    image: peterpeerdeman/pebble-ingest:1.0.0
+    image: ghcr.io/peterpeerdeman/pebble-ingest:1.0.0
     container_name: pebble-ingest
     restart: always
     ports: ["8088:8088"]
@@ -123,13 +123,22 @@ does real HTTPS, so self-signed will not work.
 
 ## Image
 
+Published by CI as `ghcr.io/peterpeerdeman/pebble-ingest` (`latest`, `1.0.0`,
+`sha-…`), a multi-arch manifest for **linux/386, linux/amd64 and linux/arm64**,
+so the same tag deploys on a 32-bit x86 box, a 64-bit x86 box and a Raspberry Pi.
+To also publish under `peterpeerdeman/pebble-ingest` on Docker Hub, add the
+`DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repo secrets, or push by hand:
+
+```sh
+docker buildx build --platform linux/386,linux/amd64,linux/arm64 \
+  -t peterpeerdeman/pebble-ingest:1.0.0 -t peterpeerdeman/pebble-ingest:latest --push .
+```
+
 Multi-arch Dockerfile; the build stage cross-compiles on the build host, so no
 emulated rustc:
 
 ```sh
-docker buildx build --platform linux/386 -t peterpeerdeman/pebble-ingest:1.0.0 --load .
-docker buildx build --platform linux/386,linux/amd64,linux/arm64 \
-  -t peterpeerdeman/pebble-ingest:1.0.0 -t peterpeerdeman/pebble-ingest:latest --push .
+docker buildx build --platform linux/386 -t ghcr.io/peterpeerdeman/pebble-ingest:1.0.0 --load .
 ```
 
 Runtime image is `debian:bookworm-slim` + one static-ish binary (~3 MB), runs
@@ -141,7 +150,7 @@ pushes `linux/386,amd64,arm64` to GHCR (and to Docker Hub when
 To ship an image to a host without a registry:
 
 ```sh
-docker save peterpeerdeman/pebble-ingest:1.0.0 | gzip > pebble-ingest-1.0.0-i386.tar.gz
+docker save ghcr.io/peterpeerdeman/pebble-ingest:1.0.0 | gzip > pebble-ingest-1.0.0-i386.tar.gz
 # on the host:
 gunzip -c pebble-ingest-1.0.0-i386.tar.gz | docker load
 ```
