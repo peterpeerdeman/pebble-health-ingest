@@ -16,8 +16,11 @@ RUN rust-target
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# The three arch builds run concurrently and share these mounts. `sharing=locked`
+# serialises registry access (else cargo races unpacking a crate: "…/.cargo-ok
+# File exists"); the target cache is keyed per-arch so artifacts don't collide.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,id=target-${TARGETPLATFORM} \
     . /etc/rust-target.env \
     && cargo build --release --locked --target "$RUST_TARGET" \
     && cp "target/$RUST_TARGET/release/pebble-ingest" /pebble-ingest

@@ -250,3 +250,55 @@ WHERE $timeFilter GROUP BY time(1d, '-2h') fill(null)   -- or tz('Europe/Amsterd
 
 No rewrite of the historical archive, no dashboard rebuild, and the change is
 contained to the service this repo already owns and tests.
+
+---
+
+## 7. Copying the Fitbit archive into `health` (ready-to-run)
+
+`health` uses the same measurement names as `fitbit`, so the archive copies
+across with InfluxDB's server-side `SELECT … INTO`. Run these against the host
+Influx (`192.168.117.5:8086`). All are idempotent — a point overwrites the same
+(measurement, tags, time), so re-running after a timeout simply finishes the job.
+
+**Copy only the real time-series.** `heartratezones` (2.2M points) and `user`
+(542k) were logged with no timestamp, so every point sits at its ingestion
+instant — they are repeated snapshots, not history. Skip them.
+
+```sh
+H=192.168.117.5
+
+# Daily + sleep summaries (small, seconds each). Re-run any that report a
+# timeout; the copy keeps running server-side and re-running finishes it.
+for m in activities sleepsummaries sleep; do
+  curl -s -XPOST "http://$H:8086/query" \
+    --data-urlencode 'db=fitbit' \
+    --data-urlencode "q=SELECT * INTO \"health\".\"autogen\".\"$m\" FROM \"$m\" GROUP BY *"
+  echo " <- $m"
+done
+
+# Intraday heart rate is large (~1.5M+ points); copy it a year at a time so no
+# single request runs too long.
+for y in 2020 2021 2022 2023 2024 2025 2026; do
+  n=$((y+1))
+  curl -s -XPOST "http://$H:8086/query" \
+    --data-urlencode 'db=fitbit' \
+    --data-urlencode "q=SELECT * INTO \"health\".\"autogen\".\"heartrate\" FROM \"heartrate\" WHERE time >= '$y-01-01' AND time < '$n-01-01' GROUP BY *"
+  echo " <- heartrate $y"
+done
+```
+
+Verify a copy matches its source (counts should be equal after all re-runs):
+
+```sh
+for db in fitbit health; do
+  curl -s -G "http://$H:8086/query" --data-urlencode "db=$db" \
+    --data-urlencode 'q=SELECT count(steps) FROM "activities"'
+  echo " ($db)"
+done
+```
+
+The Fitbit archive is stamped at local midnight and the live Pebble mirror now
+matches it, so `activities`/`sleepsummaries`/`heartrate` in `health` form one
+continuous series across the 2026-08 → 2026-09 handoff. Point the Grafana panels
+at the `health` datasource; no query changes are needed beyond the measurement
+already being the same.
