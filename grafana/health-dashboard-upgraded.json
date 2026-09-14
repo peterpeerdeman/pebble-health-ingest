@@ -249,7 +249,7 @@
           "refId": "A",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "query": "SELECT min(\"value\") FROM \"heartrate\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
+          "query": "SELECT mean(\"restingHeartRate\") FROM \"activities\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
           "orderByTime": "ASC",
           "policy": "default"
         }
@@ -981,10 +981,10 @@
           "refId": "C",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "query": "SELECT min(\"value\") FROM \"heartrate\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
+          "query": "SELECT mean(\"restingHeartRate\") FROM \"activities\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
           "orderByTime": "ASC",
           "policy": "default",
-          "alias": "Min (resting)"
+          "alias": "Resting"
         }
       ]
     },
@@ -1104,7 +1104,7 @@
           "refId": "A",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "query": "SELECT min(\"value\") FROM \"heartrate\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
+          "query": "SELECT mean(\"restingHeartRate\") FROM \"activities\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
           "orderByTime": "ASC",
           "policy": "default",
           "alias": "Daily resting",
@@ -1118,7 +1118,7 @@
           "refId": "B",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "query": "SELECT moving_average(min(\"value\"), 30) FROM \"heartrate\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
+          "query": "SELECT moving_average(mean(\"restingHeartRate\"), 30) FROM \"activities\" WHERE $timeFilter GROUP BY time(1d) fill(none)",
           "orderByTime": "ASC",
           "policy": "default",
           "alias": "30d average"
