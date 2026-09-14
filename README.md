@@ -55,11 +55,28 @@ Rules applied on the way in:
 | Measurement | Tags | Fields | Timestamp |
 |---|---|---|---|
 | `pebble_minute` | `device`, `source=alloy` | `steps`, `hr`, `vmc`, `orientation`, `light` (all int, sparse) | minute |
-| `pebble_daily` | `device` | `steps`, `sleep_s`, `sleep_restful_s`, `active_s`, `distance_m`, `active_kcal`, `resting_kcal`, `hr_resting` | start of day |
+| `pebble_daily` | `device` | `steps`, `sleep_s`, `sleep_restful_s`, `active_s`, `distance_m`, `active_kcal`, `resting_kcal`, `hr_resting`¹ | start of day |
 | `pebble_activity` | `device`, `type` | `duration_s` | session start |
+
+¹ server-computed from `pebble_minute` history when possible; see below.
 
 On startup the service creates the database and a default retention policy
 `raw` (`INFLUX_RETENTION`, default `104w`) if they do not exist.
+
+### Resting heart rate
+
+`hr_resting` in the batch is the watch's own naive daily-minimum query and is
+used as a fallback only. On the batch carrying the daily rollup, the service
+instead queries its own `pebble_minute` history (`RESTING_HR_LOOKBACK_HOURS`,
+default 20h) and estimates resting HR as the **median** heart rate among
+minutes that were still (`vmc <= RESTING_HR_VMC_MAX`, default 40, and
+`steps=0`), publishing it only once at least `RESTING_HR_MIN_SAMPLES` (default
+20) such minutes exist. See the doc comment in `src/resting_hr.rs` for why
+median rather than a low percentile or the daily minimum: those were tested
+against ~20 days of paired Fitbit data and consistently undershot Fitbit's own
+reported value by 7-9 bpm, most likely PPG sensor noise pulling the low end
+down; the median was off by about half that and, being a median, is
+inherently resistant to exactly that kind of noise.
 
 ### Unified `health` mirror (Fitbit-schema consolidation)
 
@@ -92,6 +109,9 @@ idempotent and failures are logged, not fatal.
 | `INFLUX_RETENTION` | `104w` | default retention policy on `pebble`; `none` to skip |
 | `HEALTH_DB` | `health` | unified Fitbit-schema database to mirror into; `none` to disable |
 | `HEALTH_TZ` | `Europe/Amsterdam` | timezone for daily local-midnight timestamps in `health` |
+| `RESTING_HR_LOOKBACK_HOURS` | `20` | how far back to query `pebble_minute` history for the resting HR estimate |
+| `RESTING_HR_VMC_MAX` | `40` | `vmc` at or below this counts as "still"; not yet calibrated against real device data |
+| `RESTING_HR_MIN_SAMPLES` | `20` | minimum still, HR-bearing minutes required before publishing an estimate |
 | `LISTEN_ADDR` | `0.0.0.0:8088` | |
 | `RUST_LOG` | `info` | |
 

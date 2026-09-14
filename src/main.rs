@@ -9,6 +9,7 @@
 
 mod influx;
 mod line;
+mod resting_hr;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -48,6 +49,19 @@ pub struct Config {
     /// Timezone whose local midnight the daily `health` points are stamped at,
     /// so they line up with the Fitbit archive's local-midnight timestamps.
     pub health_tz: chrono_tz::Tz,
+    /// How far back to look for `pebble_minute` history when estimating
+    /// resting heart rate - wide enough to cover last night's sleep even if
+    /// this sync is running mid-afternoon. See resting_hr.rs.
+    pub resting_hr_lookback_hours: i64,
+    /// `vmc` at or below this counts as "still" for the resting HR estimate.
+    /// No real-device data to calibrate this against yet (see
+    /// docs/consolidation-plan.md's note on the watch's small sample so far);
+    /// revisit once more history has accumulated.
+    pub resting_hr_vmc_max: i64,
+    /// Minimum qualifying (still, HR-bearing) minutes required before
+    /// publishing an estimate at all, rather than one derived from a handful
+    /// of noisy points.
+    pub resting_hr_min_samples: usize,
     pub listen_addr: SocketAddr,
 }
 
@@ -71,6 +85,9 @@ impl Config {
             health_tz: env_or("HEALTH_TZ", "Europe/Amsterdam")
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid HEALTH_TZ: {e}"))?,
+            resting_hr_lookback_hours: env_or("RESTING_HR_LOOKBACK_HOURS", "20").parse()?,
+            resting_hr_vmc_max: env_or("RESTING_HR_VMC_MAX", "40").parse()?,
+            resting_hr_min_samples: env_or("RESTING_HR_MIN_SAMPLES", "20").parse()?,
             listen_addr,
         })
     }
@@ -319,8 +336,11 @@ struct Rendered {
 }
 
 /// Turn a validated batch into line protocol. Pure, so it is unit-testable
-/// without Influx; `now` is injected for the same reason.
-fn render_batch(batch: &Batch, device: &str, now: i64) -> Rendered {
+/// without Influx; `now` is injected for the same reason. `resting_hr` is the
+/// server-computed estimate (see resting_hr.rs), preferred over the watch's
+/// own naive `daily.hr_resting` when available - `None` here just means "fall
+/// back to the watch's value", not "no history was queried".
+fn render_batch(batch: &Batch, device: &str, now: i64, resting_hr: Option<i64>) -> Rendered {
     let mut body = String::with_capacity(batch.minutes.len() * 96);
     let mut accepted = 0usize;
     let mut rejected = 0usize;
@@ -370,7 +390,10 @@ fn render_batch(batch: &Batch, device: &str, now: i64) -> Rendered {
                 .ifield("distance_m", d.distance_m)
                 .ifield("active_kcal", d.active_kcal)
                 .ifield("resting_kcal", d.resting_kcal)
-                .ifield("hr_resting", d.hr_resting.filter(|&hr| hr > 0));
+                .ifield(
+                    "hr_resting",
+                    resting_hr.or_else(|| d.hr_resting.filter(|&hr| hr > 0)),
+                );
             if let Some(l) = p.finish() {
                 body.push_str(&l);
                 body.push('\n');
@@ -427,7 +450,13 @@ fn opt_sum(a: Option<i64>, b: Option<i64>) -> Option<f64> {
     }
 }
 
-fn render_health(batch: &Batch, device: &str, now: i64, tz: chrono_tz::Tz) -> String {
+fn render_health(
+    batch: &Batch,
+    device: &str,
+    now: i64,
+    tz: chrono_tz::Tz,
+    resting_hr: Option<i64>,
+) -> String {
     let mut body = String::new();
     let in_range = |t: i64| t <= now + MAX_FUTURE_SECS && t >= now - MAX_AGE_SECS;
     let f = |v: Option<i64>| v.map(|x| x as f64);
@@ -445,7 +474,10 @@ fn render_health(batch: &Batch, device: &str, now: i64, tz: chrono_tz::Tz) -> St
                     .ffield("caloriesBMR", f(d.resting_kcal))
                     .ffield("activityCalories", f(d.active_kcal))
                     .ffield("activeMinutes", d.active_s.map(|s| s as f64 / 60.0))
-                    .ffield("restingHeartRate", f(d.hr_resting.filter(|&hr| hr > 0)));
+                    .ffield(
+                        "restingHeartRate",
+                        f(resting_hr.or_else(|| d.hr_resting.filter(|&hr| hr > 0))),
+                    );
                 if let Some(l) = p.finish() {
                     body.push_str(&l);
                     body.push('\n');
@@ -501,7 +533,17 @@ async fn ingest(
         sanitize_device(&batch.device).ok_or((StatusCode::BAD_REQUEST, "bad device".into()))?;
 
     let now = unix_now();
-    let r = render_batch(&batch, &device, now);
+
+    // Only worth the extra query on the page that actually carries a daily
+    // rollup (once per sync, per the watchapp's `extras` pattern) - every
+    // other page is just minute history with nothing to attach it to.
+    let resting_hr = if batch.daily.is_some() {
+        estimate_resting_hr(&st, &device, now).await
+    } else {
+        None
+    };
+
+    let r = render_batch(&batch, &device, now, resting_hr);
 
     if !r.body.is_empty() {
         influx::write(&st, &st.cfg.influx_db, &r.body)
@@ -516,7 +558,7 @@ async fn ingest(
     // in the Fitbit schema. A mirror failure must not fail the ingest — the
     // native pebble write already succeeded — so it is logged, not returned.
     if let Some(health_db) = &st.cfg.health_db {
-        let health = render_health(&batch, &device, now, st.cfg.health_tz);
+        let health = render_health(&batch, &device, now, st.cfg.health_tz, resting_hr);
         if !health.is_empty() {
             if let Err(e) = influx::write(&st, health_db, &health).await {
                 tracing::warn!(device = %device, error = %e, "health mirror write failed");
@@ -531,6 +573,7 @@ async fn ingest(
         daily = batch.daily.is_some(),
         activities = batch.activities.len(),
         highwater = ?r.highwater,
+        resting_hr = ?resting_hr,
         "batch written"
     );
     Ok(Json(IngestReply {
@@ -538,6 +581,27 @@ async fn ingest(
         rejected: r.rejected,
         highwater: r.highwater,
     }))
+}
+
+/// Queries recent `pebble_minute` history and estimates resting heart rate
+/// from it (see resting_hr.rs). `None` on a query failure or when there
+/// simply isn't a confident estimate yet - both cases fall back to the
+/// watch's own value in render_batch/render_health, so this is never fatal
+/// to the ingest.
+async fn estimate_resting_hr(st: &Arc<AppState>, device: &str, now: i64) -> Option<i64> {
+    let since = now - st.cfg.resting_hr_lookback_hours * 3600;
+    let minutes = match influx::recent_minutes(st, device, since).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(device = %device, error = %e, "resting hr history query failed");
+            return None;
+        }
+    };
+    resting_hr::compute(
+        &minutes,
+        st.cfg.resting_hr_vmc_max,
+        st.cfg.resting_hr_min_samples,
+    )
 }
 
 #[derive(Deserialize)]
@@ -669,7 +733,7 @@ mod tests {
                 {"t": NOW - 60, "steps": 0, "hr": 0, "vmc": 12, "orientation": 97, "light": 2}
             ]
         }));
-        let r = render_batch(&b, "pt2", NOW);
+        let r = render_batch(&b, "pt2", NOW, None);
         assert_eq!(r.accepted, 2);
         assert_eq!(r.rejected, 0);
         assert_eq!(r.highwater, Some(NOW));
@@ -697,7 +761,7 @@ mod tests {
                 {"t": NOW - 180, "vmc": 7}
             ]
         }));
-        let r = render_batch(&b, "pt2", NOW);
+        let r = render_batch(&b, "pt2", NOW, None);
         assert_eq!(r.accepted, 4);
         assert_eq!(r.rejected, 1);
         let lines: Vec<&str> = r.body.lines().collect();
@@ -733,7 +797,7 @@ mod tests {
                 {"t": NOW - 120, "vmc": 5}
             ]
         }));
-        let r = render_batch(&b, "pt2", NOW);
+        let r = render_batch(&b, "pt2", NOW, None);
         assert_eq!(r.accepted, 1);
         assert_eq!(r.rejected, 3);
         assert_eq!(r.highwater, Some(NOW - 120));
@@ -751,7 +815,7 @@ mod tests {
                 {"type": "run", "start": NOW, "end": NOW}
             ]
         }));
-        let r = render_batch(&b, "pt2", NOW);
+        let r = render_batch(&b, "pt2", NOW, None);
         assert_eq!(r.accepted, 0);
         assert_eq!(r.highwater, None);
         let day = NOW - NOW.rem_euclid(86_400);
@@ -787,7 +851,7 @@ mod tests {
                 [noon_cet + 60, 0, 12, 97, 1, 0]
             ]
         }));
-        let body = render_health(&b, "pt2", noon_cet, chrono_tz::Europe::Amsterdam);
+        let body = render_health(&b, "pt2", noon_cet, chrono_tz::Europe::Amsterdam, None);
         let lines: Vec<&str> = body.lines().collect();
 
         // local midnight of 2025-01-15 in Amsterdam = 2025-01-14 23:00:00 UTC
@@ -816,14 +880,14 @@ caloriesBMR=1680.0,activityCalories=940.0,activeMinutes=55.0,restingHeartRate=52
     #[test]
     fn health_mirror_is_empty_without_daily_or_hr() {
         let b = batch(json!({"device": "pt2", "minutes": [[NOW, 5, 30, 97, 2, 0]]}));
-        assert!(render_health(&b, "pt2", NOW, chrono_tz::Europe::Amsterdam).is_empty());
+        assert!(render_health(&b, "pt2", NOW, chrono_tz::Europe::Amsterdam, None).is_empty());
     }
 
     #[test]
     fn replaying_a_batch_renders_identically() {
         let b = batch(json!({"device": "pt2", "minutes": [{"t": NOW + 5, "vmc": 1}]}));
-        let a = render_batch(&b, "pt2", NOW).body;
-        let c = render_batch(&b, "pt2", NOW + 30).body;
+        let a = render_batch(&b, "pt2", NOW, None).body;
+        let c = render_batch(&b, "pt2", NOW + 30, None).body;
         assert_eq!(a, c);
     }
 
@@ -870,6 +934,9 @@ caloriesBMR=1680.0,activityCalories=940.0,activeMinutes=55.0,restingHeartRate=52
                 influx_retention: None,
                 health_db: None,
                 health_tz: chrono_tz::Europe::Amsterdam,
+                resting_hr_lookback_hours: 20,
+                resting_hr_vmc_max: 40,
+                resting_hr_min_samples: 20,
                 listen_addr: "127.0.0.1:0".parse().unwrap(),
             },
             http: reqwest::Client::new(),
@@ -928,6 +995,102 @@ caloriesBMR=1680.0,activityCalories=940.0,activeMinutes=55.0,restingHeartRate=52
         let w = writes.lock().unwrap();
         assert_eq!(w.len(), 1);
         assert!(w[0].starts_with("pebble_minute,device=pt2,source=alloy steps=12i,hr=68i"));
+    }
+
+    /// Like `mock_influx`, but `/query` answers a `recent_minutes`-shaped
+    /// query (`SELECT hr, vmc, steps FROM pebble_minute ...`) with 25 still,
+    /// low-HR rows (hr 44-46, vmc=5, steps=0) - enough to clear
+    /// `resting_hr_min_samples` and produce a confident estimate distinct
+    /// from any `daily.hr_resting` a test sends. `last_minute`-shaped queries
+    /// (`SELECT last("vmc") ...`) still get the single-row response, so
+    /// `/v1/pebble/state` keeps working the same as in `mock_influx`.
+    async fn mock_influx_with_minute_history() -> (String, Arc<Mutex<Vec<String>>>) {
+        let writes: Arc<Mutex<Vec<String>>> = Arc::default();
+        let w = writes.clone();
+        let app = Router::new()
+            .route(
+                "/write",
+                post(move |body: String| {
+                    let w = w.clone();
+                    async move {
+                        w.lock().unwrap().push(body);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route(
+                "/query",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    if q["q"].starts_with("SELECT last") {
+                        return Json(json!({"results":[{"series":[{"values":[[NOW, 340]]}]}]}));
+                    }
+                    if q["q"].starts_with("SELECT hr") {
+                        let rows: Vec<_> = (0..25)
+                            .map(|i| json!([NOW - i * 60, 44 + (i % 3), 5, 0]))
+                            .collect();
+                        return Json(json!({"results":[{"series":[{"values": rows}]}]}));
+                    }
+                    Json(json!({"results":[{}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), writes)
+    }
+
+    fn app_with_health(influx_url: &str) -> App {
+        super::app(Arc::new(AppState {
+            cfg: Config {
+                token: "dev-token".into(),
+                influx_url: influx_url.into(),
+                influx_db: "pebble".into(),
+                influx_user: None,
+                influx_password: None,
+                influx_retention: None,
+                health_db: Some("health".into()),
+                health_tz: chrono_tz::Europe::Amsterdam,
+                resting_hr_lookback_hours: 20,
+                resting_hr_vmc_max: 40,
+                resting_hr_min_samples: 20,
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+            },
+            http: reqwest::Client::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn resting_hr_estimate_overrides_the_watchs_naive_value() {
+        let (url, writes) = mock_influx_with_minute_history().await;
+        let app = app_with_health(&url);
+        let now = unix_now();
+        let day = now - now.rem_euclid(86_400);
+
+        // The watch's own naive daily-minimum query said 70 - obviously not a
+        // resting rate. The mocked history (median ~45) should win instead.
+        let payload = json!({
+            "device": "pt2",
+            "daily": {"t": day, "steps": 100, "hr_resting": 70}
+        });
+        let req = Request::post("/v1/pebble/minutes")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer dev-token")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let w = writes.lock().unwrap();
+        let daily = w.iter().find(|l| l.starts_with("pebble_daily")).unwrap();
+        assert!(
+            daily.contains("hr_resting=45i"),
+            "expected hr_resting=45i, got: {daily}"
+        );
+        let health = w.iter().find(|l| l.starts_with("activities")).unwrap();
+        assert!(
+            health.contains("restingHeartRate=45.0"),
+            "expected restingHeartRate=45.0, got: {health}"
+        );
     }
 
     #[tokio::test]

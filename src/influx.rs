@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::resting_hr::MinuteSample;
 use crate::AppState;
 
 fn base_params(st: &AppState, db: &str) -> Vec<(&'static str, String)> {
@@ -45,6 +46,39 @@ pub async fn last_minute(st: &Arc<AppState>, device: &str) -> anyhow::Result<Opt
     let q = format!("SELECT last(\"vmc\") FROM \"pebble_minute\" WHERE \"device\" = '{device}'");
     let v = query(st, &st.cfg.influx_db, &q).await?;
     Ok(v["results"][0]["series"][0]["values"][0][0].as_i64())
+}
+
+/// `hr`, `vmc` and `steps` for every `pebble_minute` point at or after
+/// `since` (unix seconds), for the resting heart rate estimate in
+/// `resting_hr::compute`. Missing fields on a given minute come back as
+/// `None` from Influx and are kept as such, not coerced to zero.
+pub async fn recent_minutes(
+    st: &Arc<AppState>,
+    device: &str,
+    since: i64,
+) -> anyhow::Result<Vec<MinuteSample>> {
+    let q = format!(
+        "SELECT hr, vmc, steps FROM \"pebble_minute\" WHERE \"device\" = '{device}' AND time >= {since}s"
+    );
+    let v = query(st, &st.cfg.influx_db, &q).await?;
+
+    let empty = Vec::new();
+    let rows = v["results"][0]["series"][0]["values"]
+        .as_array()
+        .unwrap_or(&empty);
+
+    let as_int = |v: &serde_json::Value| -> Option<i64> {
+        v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+    };
+
+    Ok(rows
+        .iter()
+        .map(|row| MinuteSample {
+            hr: row.get(1).and_then(as_int),
+            vmc: row.get(2).and_then(as_int),
+            steps: row.get(3).and_then(as_int),
+        })
+        .collect())
 }
 
 /// Best-effort, idempotent schema setup at startup. Never fatal: the service

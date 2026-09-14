@@ -49,6 +49,13 @@ services:
       # database in the Fitbit schema (see docs/consolidation-plan.md).
       HEALTH_DB: health
       HEALTH_TZ: Europe/Amsterdam
+      # Server-side resting heart rate estimate from pebble_minute history;
+      # see README.md#resting-heart-rate. Defaults shown explicitly since
+      # RESTING_HR_VMC_MAX in particular isn't calibrated against real device
+      # data yet and is the first thing to revisit.
+      RESTING_HR_LOOKBACK_HOURS: 20
+      RESTING_HR_VMC_MAX: 40
+      RESTING_HR_MIN_SAMPLES: 20
       RUST_LOG: info
     depends_on:
       - influxdb
