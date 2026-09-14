@@ -1,0 +1,54 @@
+# Full stack: InfluxDB 1.8 + Grafana + pebble-ingest.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d
+#
+# Already running influxdb/grafana (e.g. raspcomposer)? Only add the
+# `pebble-ingest` service to that compose file; see README.md.
+
+services:
+  influxdb:
+    image: influxdb:1.8
+    container_name: influxdb
+    restart: always
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb
+    environment:
+      INFLUXDB_DB: pebble
+      INFLUXDB_HTTP_LOG_ENABLED: "false"
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    depends_on:
+      - influxdb
+
+  pebble-ingest:
+    image: peterpeerdeman/pebble-ingest:1.0.0
+    build: .
+    container_name: pebble-ingest
+    restart: always
+    ports:
+      - "8088:8088"
+    environment:
+      INGEST_TOKEN: ${INGEST_TOKEN:?set INGEST_TOKEN in .env}
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_DB: pebble
+      INFLUX_RETENTION: 104w
+      RUST_LOG: info
+    depends_on:
+      - influxdb
+
+volumes:
+  influxdb-data:
+  grafana-data:

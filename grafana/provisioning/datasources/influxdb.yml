@@ -1,0 +1,12 @@
+apiVersion: 1
+datasources:
+  - name: InfluxDB-pebble
+    uid: influx-pebble
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    database: pebble
+    isDefault: false
+    editable: true
+    jsonData:
+      httpMode: GET

@@ -1,0 +1,123 @@
+//! Thin InfluxDB 1.8 HTTP client: `/write` and `/query` only.
+
+use std::sync::Arc;
+
+use crate::AppState;
+
+fn base_params(st: &AppState) -> Vec<(&'static str, String)> {
+    let mut q = vec![("db", st.cfg.influx_db.clone())];
+    if let Some(u) = &st.cfg.influx_user {
+        q.push(("u", u.clone()));
+        q.push(("p", st.cfg.influx_password.clone().unwrap_or_default()));
+    }
+    q
+}
+
+/// Write a body of line-protocol points with second precision.
+pub async fn write(st: &Arc<AppState>, body: &str) -> anyhow::Result<()> {
+    let url = format!("{}/write", st.cfg.influx_url);
+    let mut params = base_params(st);
+    params.push(("precision", "s".into()));
+
+    let resp = st
+        .http
+        .post(&url)
+        .query(&params)
+        .body(body.to_string())
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("influx write failed: {status} {text}");
+    }
+    Ok(())
+}
+
+/// Newest minute already stored for this device, as a unix second.
+///
+/// Queries `vmc` rather than `steps`: `vmc` is present in essentially every
+/// valid minute record, whereas `steps` can legitimately be absent.
+pub async fn last_minute(st: &Arc<AppState>, device: &str) -> anyhow::Result<Option<i64>> {
+    // `device` has already passed `sanitize_device` (alphanumerics, '-', '_'),
+    // so it cannot break out of the quoted literal.
+    let q = format!("SELECT last(\"vmc\") FROM \"pebble_minute\" WHERE \"device\" = '{device}'");
+    let v = query(st, &q).await?;
+    Ok(v["results"][0]["series"][0]["values"][0][0].as_i64())
+}
+
+/// Best-effort, idempotent schema setup at startup. Never fatal: the service
+/// still starts if Influx is down, and the first write will surface the error.
+pub async fn ensure_database(st: &Arc<AppState>) {
+    let db = &st.cfg.influx_db;
+    let stmts = {
+        let mut s = vec![format!("CREATE DATABASE \"{db}\"")];
+        if let Some(rp) = &st.cfg.influx_retention {
+            s.push(format!(
+                "CREATE RETENTION POLICY \"raw\" ON \"{db}\" DURATION {rp} REPLICATION 1 DEFAULT"
+            ));
+        }
+        s
+    };
+
+    for attempt in 1..=10u32 {
+        let mut ok = true;
+        for stmt in &stmts {
+            match exec(st, stmt).await {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("already exists") => {}
+                Err(e) => {
+                    ok = false;
+                    tracing::warn!(attempt, error = %e, stmt, "influx schema setup failed");
+                    break;
+                }
+            }
+        }
+        if ok {
+            tracing::info!(db, "influx schema ready");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    tracing::warn!("giving up on influx schema setup; will rely on writes surfacing errors");
+}
+
+async fn exec(st: &Arc<AppState>, stmt: &str) -> anyhow::Result<()> {
+    let url = format!("{}/query", st.cfg.influx_url);
+    let mut params = base_params(st);
+    params.push(("q", stmt.to_string()));
+    let resp = st.http.post(&url).query(&params).send().await?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!("influx query failed: {status} {v}");
+    }
+    if let Some(err) = v["results"][0]["error"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+    {
+        anyhow::bail!("{err}");
+    }
+    Ok(())
+}
+
+async fn query(st: &Arc<AppState>, q: &str) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}/query", st.cfg.influx_url);
+    let mut params = base_params(st);
+    params.push(("q", q.to_string()));
+    params.push(("epoch", "s".into()));
+    let resp = st.http.get(&url).query(&params).send().await?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!("influx query failed: {status} {v}");
+    }
+    if let Some(err) = v["results"][0]["error"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+    {
+        anyhow::bail!("influx query error: {err}");
+    }
+    Ok(v)
+}

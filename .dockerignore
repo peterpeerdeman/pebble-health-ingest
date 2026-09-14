@@ -1,0 +1,6 @@
+target
+.git
+.env
+grafana
+docs
+*.md
