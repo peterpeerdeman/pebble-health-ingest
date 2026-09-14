@@ -1,0 +1,154 @@
+{
+  "uid": "pebble-health-debug",
+  "title": "Pebble Health - Raw Debug",
+  "tags": ["pebble", "health", "debug"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "",
+  "time": { "from": "now-7d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "label": "Device",
+        "type": "query",
+        "datasource": { "type": "influxdb", "uid": "influx-pebble" },
+        "query": "SHOW TAG VALUES FROM \"pebble_minute\" WITH KEY = \"device\"",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Raw points — no GROUP BY, no aggregation",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "vmc, raw (collapsed/overwritten points would show as a flat gap here)",
+      "description": "One point per stored minute, plotted individually with no time bucketing. A real backfill should show a dense, continuous scatter of points across the whole selected range; a stall or timestamp collision shows up as a cluster followed by an empty gap.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 1 },
+      "datasource": { "type": "influxdb", "uid": "influx-pebble" },
+      "targets": [
+        {
+          "refId": "A",
+          "rawQuery": true,
+          "query": "SELECT \"vmc\" FROM \"pebble_minute\" WHERE \"device\" =~ /^$device$/ AND $timeFilter",
+          "resultFormat": "time_series",
+          "alias": "vmc"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "points", "pointSize": 3, "spanNulls": false }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "hidden" }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Last 500 raw pebble_minute rows",
+      "description": "Exact stored timestamps, newest first. Look for: repeated identical Time values (would mean writes are colliding), a Time column that jumps straight from now to many days ago (would mean the backfill only ever completes one page), or Time values that don't fall on :00 seconds (would mean the minute-snap isn't happening).",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 9 },
+      "datasource": { "type": "influxdb", "uid": "influx-pebble" },
+      "targets": [
+        {
+          "refId": "A",
+          "rawQuery": true,
+          "query": "SELECT \"steps\", \"hr\", \"vmc\", \"orientation\", \"light\" FROM \"pebble_minute\" WHERE \"device\" =~ /^$device$/ AND $timeFilter ORDER BY time DESC LIMIT 500",
+          "resultFormat": "table"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Coverage over time",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Points received per hour",
+      "description": "Should be ~60 per hour while worn. A backfill that's stuck after the first page shows as a single tall bar followed by nothing; normal catch-up shows a steady climb toward 60/hr; real gaps (watch off wrist, phone unreachable) show as legitimate dips to 0.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "influxdb", "uid": "influx-pebble" },
+      "targets": [
+        {
+          "refId": "A",
+          "rawQuery": true,
+          "query": "SELECT count(\"vmc\") FROM \"pebble_minute\" WHERE \"device\" =~ /^$device$/ AND $timeFilter GROUP BY time(1h) fill(0)",
+          "resultFormat": "time_series",
+          "alias": "points/hour"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "hidden" }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Distinct minute-points stored (selected range)",
+      "description": "If this is suspiciously low relative to the time range (e.g. 1-20 instead of thousands over 7 days), points are colliding on write or the backfill is stalling, not a Grafana display artifact.",
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "influxdb", "uid": "influx-pebble" },
+      "targets": [
+        {
+          "refId": "A",
+          "rawQuery": true,
+          "query": "SELECT count(\"vmc\") FROM \"pebble_minute\" WHERE \"device\" =~ /^$device$/ AND $timeFilter",
+          "resultFormat": "time_series",
+          "alias": "points"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Last 100 raw pebble_daily / pebble_activity rows",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "influxdb", "uid": "influx-pebble" },
+      "targets": [
+        {
+          "refId": "A",
+          "rawQuery": true,
+          "query": "SELECT * FROM \"pebble_daily\" WHERE \"device\" =~ /^$device$/ AND $timeFilter ORDER BY time DESC LIMIT 50",
+          "resultFormat": "table"
+        },
+        {
+          "refId": "B",
+          "rawQuery": true,
+          "query": "SELECT * FROM \"pebble_activity\" WHERE \"device\" =~ /^$device$/ AND $timeFilter ORDER BY time DESC LIMIT 50",
+          "resultFormat": "table"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": {}
+    }
+  ]
+}

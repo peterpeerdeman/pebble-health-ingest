@@ -59,7 +59,26 @@ Rules applied on the way in:
 | `pebble_activity` | `device`, `type` | `duration_s` | session start |
 
 On startup the service creates the database and a default retention policy
-`raw` (`INFLUX_RETENTION`, default `104w`) if they do not exist. Both are
+`raw` (`INFLUX_RETENTION`, default `104w`) if they do not exist.
+
+### Unified `health` mirror (Fitbit-schema consolidation)
+
+To join the watch's data onto a pre-existing Fitbit history, the service also
+mirrors the continuity series into a second database, `health`, in the **Fitbit
+archive's schema** — float fields, kilometres, minutes, and daily points stamped
+at local midnight (`HEALTH_TZ`). This is created on startup with Influx's default
+(infinite) retention so it can also hold the copied Fitbit archive.
+
+| `health` measurement | From `pebble_daily` / `pebble_minute` | Conversion |
+|---|---|---|
+| `activities` | steps, distance, calories, resting HR, active minutes | m→km, active+resting kcal, ints→floats, day→local midnight |
+| `sleepsummaries` | `totalMinutesAsleep`, `stages.deep` | s→min; restful≈deep (approximation) |
+| `heartrate` | `value` per minute with a sample | ints→floats |
+
+The mirror never fails an ingest: if the `health` write errors, it is logged and
+the native `pebble_*` write still stands. Set `HEALTH_DB=none` to turn it off.
+Rationale and the full crosswalk are in
+[docs/consolidation-plan.md](docs/consolidation-plan.md). Both are
 idempotent and failures are logged, not fatal.
 
 ## Configuration
@@ -70,7 +89,9 @@ idempotent and failures are logged, not fatal.
 | `INFLUX_URL` | `http://localhost:8086` | plain HTTP; the binary has no TLS stack |
 | `INFLUX_DB` | `pebble` | |
 | `INFLUX_USER` / `INFLUX_PASSWORD` | unset | Influx basic auth |
-| `INFLUX_RETENTION` | `104w` | default retention policy; `none` to skip |
+| `INFLUX_RETENTION` | `104w` | default retention policy on `pebble`; `none` to skip |
+| `HEALTH_DB` | `health` | unified Fitbit-schema database to mirror into; `none` to disable |
+| `HEALTH_TZ` | `Europe/Amsterdam` | timezone for daily local-midnight timestamps in `health` |
 | `LISTEN_ADDR` | `0.0.0.0:8088` | |
 | `RUST_LOG` | `info` | |
 

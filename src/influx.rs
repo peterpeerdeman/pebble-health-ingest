@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::AppState;
 
-fn base_params(st: &AppState) -> Vec<(&'static str, String)> {
-    let mut q = vec![("db", st.cfg.influx_db.clone())];
+fn base_params(st: &AppState, db: &str) -> Vec<(&'static str, String)> {
+    let mut q = vec![("db", db.to_string())];
     if let Some(u) = &st.cfg.influx_user {
         q.push(("u", u.clone()));
         q.push(("p", st.cfg.influx_password.clone().unwrap_or_default()));
@@ -13,10 +13,10 @@ fn base_params(st: &AppState) -> Vec<(&'static str, String)> {
     q
 }
 
-/// Write a body of line-protocol points with second precision.
-pub async fn write(st: &Arc<AppState>, body: &str) -> anyhow::Result<()> {
+/// Write a body of line-protocol points to `db` with second precision.
+pub async fn write(st: &Arc<AppState>, db: &str, body: &str) -> anyhow::Result<()> {
     let url = format!("{}/write", st.cfg.influx_url);
-    let mut params = base_params(st);
+    let mut params = base_params(st, db);
     params.push(("precision", "s".into()));
 
     let resp = st
@@ -43,23 +43,28 @@ pub async fn last_minute(st: &Arc<AppState>, device: &str) -> anyhow::Result<Opt
     // `device` has already passed `sanitize_device` (alphanumerics, '-', '_'),
     // so it cannot break out of the quoted literal.
     let q = format!("SELECT last(\"vmc\") FROM \"pebble_minute\" WHERE \"device\" = '{device}'");
-    let v = query(st, &q).await?;
+    let v = query(st, &st.cfg.influx_db, &q).await?;
     Ok(v["results"][0]["series"][0]["values"][0][0].as_i64())
 }
 
 /// Best-effort, idempotent schema setup at startup. Never fatal: the service
 /// still starts if Influx is down, and the first write will surface the error.
+///
+/// Creates the native `pebble` database (with the configured retention) and,
+/// when the health mirror is enabled, the unified `health` database. The latter
+/// gets Influx's default `autogen` (infinite) retention so it can hold the
+/// copied Fitbit archive; we deliberately do not put a bounded policy on it.
 pub async fn ensure_database(st: &Arc<AppState>) {
-    let db = &st.cfg.influx_db;
-    let stmts = {
-        let mut s = vec![format!("CREATE DATABASE \"{db}\"")];
-        if let Some(rp) = &st.cfg.influx_retention {
-            s.push(format!(
-                "CREATE RETENTION POLICY \"raw\" ON \"{db}\" DURATION {rp} REPLICATION 1 DEFAULT"
-            ));
-        }
-        s
-    };
+    let mut stmts = vec![format!("CREATE DATABASE \"{}\"", st.cfg.influx_db)];
+    if let Some(rp) = &st.cfg.influx_retention {
+        stmts.push(format!(
+            "CREATE RETENTION POLICY \"raw\" ON \"{}\" DURATION {rp} REPLICATION 1 DEFAULT",
+            st.cfg.influx_db
+        ));
+    }
+    if let Some(health) = &st.cfg.health_db {
+        stmts.push(format!("CREATE DATABASE \"{health}\""));
+    }
 
     for attempt in 1..=10u32 {
         let mut ok = true;
@@ -75,7 +80,11 @@ pub async fn ensure_database(st: &Arc<AppState>) {
             }
         }
         if ok {
-            tracing::info!(db, "influx schema ready");
+            tracing::info!(
+                db = %st.cfg.influx_db,
+                health = ?st.cfg.health_db,
+                "influx schema ready"
+            );
             return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -85,7 +94,7 @@ pub async fn ensure_database(st: &Arc<AppState>) {
 
 async fn exec(st: &Arc<AppState>, stmt: &str) -> anyhow::Result<()> {
     let url = format!("{}/query", st.cfg.influx_url);
-    let mut params = base_params(st);
+    let mut params = base_params(st, &st.cfg.influx_db);
     params.push(("q", stmt.to_string()));
     let resp = st.http.post(&url).query(&params).send().await?;
     let status = resp.status();
@@ -102,9 +111,9 @@ async fn exec(st: &Arc<AppState>, stmt: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn query(st: &Arc<AppState>, q: &str) -> anyhow::Result<serde_json::Value> {
+async fn query(st: &Arc<AppState>, db: &str, q: &str) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}/query", st.cfg.influx_url);
-    let mut params = base_params(st);
+    let mut params = base_params(st, db);
     params.push(("q", q.to_string()));
     params.push(("epoch", "s".into()));
     let resp = st.http.get(&url).query(&params).send().await?;

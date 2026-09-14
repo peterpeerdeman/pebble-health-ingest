@@ -43,6 +43,25 @@ impl Point {
         self
     }
 
+    /// Float field; `None` is skipped. Used for the `health` mirror, whose
+    /// measurements (copied from Fitbit) store every field as a float. Influx
+    /// line protocol treats a bare number as a float, so no `i` suffix here —
+    /// that distinction is exactly what keeps the mirror type-compatible with
+    /// the Fitbit archive (see docs/consolidation-plan.md §1b).
+    pub fn ffield(&mut self, k: &str, v: Option<f64>) -> &mut Self {
+        if let Some(v) = v {
+            if !self.fields.is_empty() {
+                self.fields.push(',');
+            }
+            self.fields.push_str(k);
+            self.fields.push('=');
+            // `{:?}` on f64 always emits a decimal point (e.g. `6349.0`), so the
+            // value is unambiguously a float even for whole numbers.
+            self.fields.push_str(&format!("{v:?}"));
+        }
+        self
+    }
+
     /// `None` when the point has no fields.
     pub fn finish(&self) -> Option<String> {
         if self.fields.is_empty() {
@@ -89,5 +108,18 @@ mod tests {
     #[test]
     fn escapes_tag_values() {
         assert_eq!(escape_tag("a b,c=d\\e"), "a\\ b\\,c\\=d\\\\e");
+    }
+
+    #[test]
+    fn float_fields_have_no_integer_suffix() {
+        let mut p = Point::new("activities", 100);
+        p.tag("device", "pt2");
+        p.ffield("steps", Some(6349.0))
+            .ffield("distance_total", Some(4.7095))
+            .ffield("restingHeartRate", None);
+        assert_eq!(
+            p.finish().unwrap(),
+            "activities,device=pt2 steps=6349.0,distance_total=4.7095 100"
+        );
     }
 }

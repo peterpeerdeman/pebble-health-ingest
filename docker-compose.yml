@@ -45,6 +45,10 @@ services:
       INFLUX_URL: http://influxdb:8086
       INFLUX_DB: pebble
       INFLUX_RETENTION: 104w
+      # Option A: also mirror the continuity series into a unified `health`
+      # database in the Fitbit schema (see docs/consolidation-plan.md).
+      HEALTH_DB: health
+      HEALTH_TZ: Europe/Amsterdam
       RUST_LOG: info
     depends_on:
       - influxdb

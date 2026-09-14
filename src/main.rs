@@ -42,6 +42,12 @@ pub struct Config {
     pub influx_password: Option<String>,
     /// Retention for the default policy, e.g. `104w`. `None` leaves Influx defaults alone.
     pub influx_retention: Option<String>,
+    /// Unified `health` database written in the Fitbit schema (Option A).
+    /// `None` disables the mirror entirely.
+    pub health_db: Option<String>,
+    /// Timezone whose local midnight the daily `health` points are stamped at,
+    /// so they line up with the Fitbit archive's local-midnight timestamps.
+    pub health_tz: chrono_tz::Tz,
     pub listen_addr: SocketAddr,
 }
 
@@ -61,6 +67,10 @@ impl Config {
             influx_user: std::env::var("INFLUX_USER").ok().filter(|s| !s.is_empty()),
             influx_password: std::env::var("INFLUX_PASSWORD").ok(),
             influx_retention: Some(env_or("INFLUX_RETENTION", "104w")).filter(|s| s != "none"),
+            health_db: Some(env_or("HEALTH_DB", "health")).filter(|s| !s.is_empty() && s != "none"),
+            health_tz: env_or("HEALTH_TZ", "Europe/Amsterdam")
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid HEALTH_TZ: {e}"))?,
             listen_addr,
         })
     }
@@ -392,6 +402,92 @@ fn render_batch(batch: &Batch, device: &str, now: i64) -> Rendered {
     }
 }
 
+// ---------- health mirror (Option A) ----------
+//
+// Writes the continuity series into the unified `health` database using the
+// Fitbit archive's schema, units and types (see docs/consolidation-plan.md):
+// float fields, kilometres, minutes, and daily points stamped at local
+// midnight so they line up with the copied Fitbit data.
+
+/// Unix second of local midnight, in `tz`, of the day containing `t`.
+fn local_midnight(t: i64, tz: chrono_tz::Tz) -> Option<i64> {
+    use chrono::{Datelike, TimeZone};
+    let dt = chrono::DateTime::from_timestamp(t, 0)?.with_timezone(&tz);
+    let d = dt.date_naive();
+    tz.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0)
+        .single()
+        .map(|m| m.timestamp())
+}
+
+/// Sum two optional integers as an f64 when at least one is present.
+fn opt_sum(a: Option<i64>, b: Option<i64>) -> Option<f64> {
+    match (a, b) {
+        (None, None) => None,
+        _ => Some((a.unwrap_or(0) + b.unwrap_or(0)) as f64),
+    }
+}
+
+fn render_health(batch: &Batch, device: &str, now: i64, tz: chrono_tz::Tz) -> String {
+    let mut body = String::new();
+    let in_range = |t: i64| t <= now + MAX_FUTURE_SECS && t >= now - MAX_AGE_SECS;
+    let f = |v: Option<i64>| v.map(|x| x as f64);
+
+    if let Some(d) = &batch.daily {
+        if in_range(d.t) {
+            if let Some(day) = local_midnight(d.t, tz) {
+                // activities: the daily summary Grafana plots for steps,
+                // distance, calories and resting HR.
+                let mut p = line::Point::new("activities", day);
+                p.tag("device", device);
+                p.ffield("steps", f(d.steps))
+                    .ffield("distance_total", d.distance_m.map(|m| m as f64 / 1000.0))
+                    .ffield("caloriesOut", opt_sum(d.active_kcal, d.resting_kcal))
+                    .ffield("caloriesBMR", f(d.resting_kcal))
+                    .ffield("activityCalories", f(d.active_kcal))
+                    .ffield("activeMinutes", d.active_s.map(|s| s as f64 / 60.0))
+                    .ffield("restingHeartRate", f(d.hr_resting.filter(|&hr| hr > 0)));
+                if let Some(l) = p.finish() {
+                    body.push_str(&l);
+                    body.push('\n');
+                }
+
+                // sleepsummaries: total sleep, plus restful sleep mapped to
+                // stages.deep as a documented approximation (the watch has no
+                // true sleep-stage breakdown).
+                let mut s = line::Point::new("sleepsummaries", day);
+                s.tag("device", device);
+                s.ffield("totalMinutesAsleep", d.sleep_s.map(|x| x as f64 / 60.0))
+                    .ffield("stages.deep", d.sleep_restful_s.map(|x| x as f64 / 60.0));
+                if let Some(l) = s.finish() {
+                    body.push_str(&l);
+                    body.push('\n');
+                }
+            }
+        }
+    }
+
+    // heartrate: one intraday point per minute that has a sample, so the HR
+    // chart is continuous across the Fitbit/Pebble seam.
+    for rec in &batch.minutes {
+        let Some(m) = rec.minute() else { continue };
+        if !in_range(m.t) {
+            continue;
+        }
+        let Some(hr) = m.hr.filter(|&hr| hr > 0) else {
+            continue;
+        };
+        let t = m.t - m.t.rem_euclid(60);
+        let mut p = line::Point::new("heartrate", t);
+        p.tag("device", device).ffield("value", Some(hr as f64));
+        if let Some(l) = p.finish() {
+            body.push_str(&l);
+            body.push('\n');
+        }
+    }
+
+    body
+}
+
 // ---------- handlers ----------
 
 async fn ingest(
@@ -404,13 +500,28 @@ async fn ingest(
     let device =
         sanitize_device(&batch.device).ok_or((StatusCode::BAD_REQUEST, "bad device".into()))?;
 
-    let r = render_batch(&batch, &device, unix_now());
+    let now = unix_now();
+    let r = render_batch(&batch, &device, now);
 
     if !r.body.is_empty() {
-        influx::write(&st, &r.body).await.map_err(|e| {
-            tracing::error!(device = %device, error = %e, "influx write failed");
-            (StatusCode::BAD_GATEWAY, e.to_string())
-        })?;
+        influx::write(&st, &st.cfg.influx_db, &r.body)
+            .await
+            .map_err(|e| {
+                tracing::error!(device = %device, error = %e, "influx write failed");
+                (StatusCode::BAD_GATEWAY, e.to_string())
+            })?;
+    }
+
+    // Option A: mirror the continuity series into the unified `health` database
+    // in the Fitbit schema. A mirror failure must not fail the ingest — the
+    // native pebble write already succeeded — so it is logged, not returned.
+    if let Some(health_db) = &st.cfg.health_db {
+        let health = render_health(&batch, &device, now, st.cfg.health_tz);
+        if !health.is_empty() {
+            if let Err(e) = influx::write(&st, health_db, &health).await {
+                tracing::warn!(device = %device, error = %e, "health mirror write failed");
+            }
+        }
     }
 
     tracing::info!(
@@ -660,6 +771,55 @@ mod tests {
     }
 
     #[test]
+    fn health_mirror_converts_units_types_and_timestamp() {
+        // A winter day (CET = UTC+1): 2025-01-15. Pick a daily timestamp in the
+        // middle of that local day and confirm it snaps to local midnight.
+        let noon_cet = 1_736_940_000; // 2025-01-15 11:00:00 UTC = 12:00 CET
+        let b = batch(json!({
+            "device": "pt2",
+            "daily": {
+                "t": noon_cet, "steps": 6349, "distance_m": 4709,
+                "active_kcal": 940, "resting_kcal": 1680, "hr_resting": 52,
+                "sleep_s": 27660, "sleep_restful_s": 3360, "active_s": 3300
+            },
+            "minutes": [
+                [noon_cet, 5, 30, 97, 2, 61],
+                [noon_cet + 60, 0, 12, 97, 1, 0]
+            ]
+        }));
+        let body = render_health(&b, "pt2", noon_cet, chrono_tz::Europe::Amsterdam);
+        let lines: Vec<&str> = body.lines().collect();
+
+        // local midnight of 2025-01-15 in Amsterdam = 2025-01-14 23:00:00 UTC
+        let midnight = 1_736_895_600;
+        assert_eq!(
+            lines[0],
+            format!(
+                "activities,device=pt2 steps=6349.0,distance_total=4.709,caloriesOut=2620.0,\
+caloriesBMR=1680.0,activityCalories=940.0,activeMinutes=55.0,restingHeartRate=52.0 {midnight}"
+            )
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "sleepsummaries,device=pt2 totalMinutesAsleep=461.0,stages.deep=56.0 {midnight}"
+            )
+        );
+        // only the minute with hr>0 becomes a heartrate point
+        assert_eq!(
+            lines[2],
+            format!("heartrate,device=pt2 value=61.0 {noon_cet}")
+        );
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn health_mirror_is_empty_without_daily_or_hr() {
+        let b = batch(json!({"device": "pt2", "minutes": [[NOW, 5, 30, 97, 2, 0]]}));
+        assert!(render_health(&b, "pt2", NOW, chrono_tz::Europe::Amsterdam).is_empty());
+    }
+
+    #[test]
     fn replaying_a_batch_renders_identically() {
         let b = batch(json!({"device": "pt2", "minutes": [{"t": NOW + 5, "vmc": 1}]}));
         let a = render_batch(&b, "pt2", NOW).body;
@@ -708,6 +868,8 @@ mod tests {
                 influx_user: None,
                 influx_password: None,
                 influx_retention: None,
+                health_db: None,
+                health_tz: chrono_tz::Europe::Amsterdam,
                 listen_addr: "127.0.0.1:0".parse().unwrap(),
             },
             http: reqwest::Client::new(),
